@@ -1,7 +1,6 @@
 use crate::{crypto_utils::CryptoUtils, db_utils::DbUtils};
 use nym_sdk::mixnet::{AnonymousSenderTag, MixnetClientSender, MixnetMessageSender, ReconstructedMessage};
-use redis::{AsyncCommands, aio::PubSubCommands};
-use futures::StreamExt;
+use redis::AsyncCommands;
 use serde_json::{Value, json};
 use std::sync::Arc;
 use tokio_stream::StreamExt;
@@ -373,7 +372,7 @@ pub fn new(
                 let mixnet_sender = self.sender.clone();
                 let client = self.redis_client.clone();
                 tokio::spawn(async move {
-                    if let Ok(mut conn) = client.get_async_connection().await {
+                        if let Ok(conn) = client.get_async_connection().await {
                         let mut pubsub = conn.into_pubsub();
                         let _ = pubsub.subscribe(&channel).await;
                         let mut on_message = pubsub.on_message();
