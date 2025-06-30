@@ -9,12 +9,12 @@ This document provides a high-level overview of the **nymstr-groupd** server, de
     |    Client App     |--------------------->|   nymstr-groupd   |
     +-------------------+                      +---------+---------+
                                                      |
-  +-------------+  +-----------+  +----------+  +-------------+
-  | EnvLoader   |  | LogConfig |  | DbUtils  |  | CryptoUtils |
-  +------+------ +  +-----+-----+  +-----+----+  +------+------+ 
-         |               |              |              |     
-         v               v              v              v     
-    (load .env)      (init logs)   (SQLite DB)   (keys dir)  
+  +---------------+  +-----------+  +----------+  +-------------+
+  | Configuration |  | LogConfig |  | DbUtils  |  | CryptoUtils |
+  +-------+-------+  +-----+-----+  +-----+----+  +------+------+ 
+          |               |              |              |     
+          v               v              v              v     
+    (read ENV vars)  (init logs)   (SQLite DB)   (keys dir)  
                                                      |
                                               +------+------+
                                               | MixnetClient |
@@ -38,7 +38,6 @@ This document provides a high-level overview of the **nymstr-groupd** server, de
 ## 2. Component Overview
 
 ### main.rs
-- **EnvLoader**: Loads environment variables from `.env` (via `dotenvy`).
 - **LogConfig**: Initializes logging (via `fern`) to both console and file.
 - **DbUtils**: Sets up and migrates the SQLite database (via `sqlx`).
 - **CryptoUtils**: Prepares encrypted key storage and password-based encryption (OpenSSL).
@@ -46,8 +45,6 @@ This document provides a high-level overview of the **nymstr-groupd** server, de
 - **RedisClient**: Connects to Redis for real-time pub/sub.
 - **MessageUtils**: Orchestrates incoming messages, command handling, DB updates, and message broadcasting.
 
-### EnvLoader (`src/env_loader.rs`)
-- Loads `.env` file into the environment at startup (errors are logged/ignored if missing).
 
 ### LogConfig (`src/log_config.rs`)
 - Configures timestamped, colored logging to stdout and also writes logs to a file.
@@ -94,7 +91,7 @@ This document provides a high-level overview of the **nymstr-groupd** server, de
 | Pub/Sub Messaging     | Redis                     |
 | Crypto Primitives     | OpenSSL (ECDSA, AES-GCM)  |
 | Key Derivation        | PBKDF2-HMAC-SHA256        |
-| Configuration Loader  | dotenvy                   |
+| Configuration Loader  | Environment variables (std::env) |
 | Logging               | fern (+ log, chrono)      |
 | Serialization         | serde, serde_json         |
 

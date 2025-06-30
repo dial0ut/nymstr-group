@@ -1,12 +1,10 @@
 mod crypto_utils;
 mod db_utils;
-mod env_loader;
 mod log_config;
 mod message_utils;
 
 use crate::crypto_utils::CryptoUtils;
 use crate::db_utils::DbUtils;
-use crate::env_loader::load_env;
 use crate::log_config::init_logging;
 use crate::message_utils::MessageUtils;
 use nym_sdk::mixnet::{MixnetClientBuilder, StoragePaths};
@@ -17,9 +15,6 @@ use tokio_stream::StreamExt;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Load environment variables from .env
-    load_env();
-
     // Initialize logging
     let log_file = std::env::var("LOG_FILE_PATH").unwrap_or_else(|_| "logs/groupd.log".to_string());
     if let Some(parent) = PathBuf::from(&log_file).parent() {
@@ -54,10 +49,22 @@ async fn main() -> anyhow::Result<()> {
     let password = std::fs::read_to_string(&secret_path_buf)?
         .trim()
         .to_string();
-    let crypto = CryptoUtils::new(PathBuf::from(&keys_dir), password.clone())?;
-
-    // Initialize mixnet client storage path and client ID (with defaults)
+    // Determine the client/server identity
     let client_id = std::env::var("NYM_CLIENT_ID").unwrap_or_else(|_| "groupd".to_string());
+    let crypto = CryptoUtils::new(
+        PathBuf::from(&keys_dir),
+        client_id.clone(),
+        password.clone(),
+    )?;
+    // Ensure the server has a PGP keypair (for signing replies).
+    let pub_key_path = PathBuf::from(&keys_dir).join(format!("{}_public.asc", client_id));
+    if !pub_key_path.exists() {
+        log::info!(
+            "Server keypair not found, generating new PGP keypair for '{}'",
+            client_id
+        );
+        crypto.generate_key_pair(&client_id)?;
+    }
     let storage_dir =
         std::env::var("NYM_SDK_STORAGE").unwrap_or_else(|_| format!("storage/{}", client_id));
     // Ensure mixnet SDK storage directory exists
