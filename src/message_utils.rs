@@ -1,10 +1,16 @@
 use crate::{crypto_utils::CryptoUtils, db_utils::DbUtils};
-use nym_sdk::mixnet::{AnonymousSenderTag, MixnetClientSender, MixnetMessageSender, ReconstructedMessage};
+use nym_sdk::mixnet::{
+    AnonymousSenderTag, MixnetClientSender, MixnetMessageSender, ReconstructedMessage,
+};
 use redis::AsyncCommands;
+use sequoia_openpgp::Cert; // PGP
+use sequoia_openpgp::parse::Parse;
 use serde_json::{Value, json};
+use std::collections::HashMap;
+use std::io::Cursor;
 use std::sync::Arc;
 use tokio_stream::StreamExt;
-use uuid::Uuid;
+use uuid::Uuid; // in-memory readers
 
 /// Handler for incoming mixnet messages and command processing for group chat server.
 pub struct MessageUtils {
@@ -13,24 +19,30 @@ pub struct MessageUtils {
     sender: MixnetClientSender,
     client_id: String,
     redis_client: Arc<redis::Client>,
+    /// Pending authentication nonces per sender tag
+    pending_auth: HashMap<AnonymousSenderTag, (String /*username*/, String /*nonce*/)>,
+    /// Authenticated sender tags mapped to username
+    authenticated: HashMap<AnonymousSenderTag, String>,
 }
 
 impl MessageUtils {
     /// Create a new MessageUtils instance.
     /// Create a new MessageUtils instance with Redis client for pub/sub.
-pub fn new(
-    client_id: String,
-    sender: MixnetClientSender,
-    db: DbUtils,
-    crypto: CryptoUtils,
-    redis_client: Arc<redis::Client>,
-) -> Self {
+    pub fn new(
+        client_id: String,
+        sender: MixnetClientSender,
+        db: DbUtils,
+        crypto: CryptoUtils,
+        redis_client: Arc<redis::Client>,
+    ) -> Self {
         MessageUtils {
             db,
             crypto,
             sender,
             client_id,
             redis_client,
+            pending_auth: HashMap::new(),
+            authenticated: HashMap::new(),
         }
     }
 
@@ -54,6 +66,7 @@ pub fn new(
                 return;
             }
         };
+        log::info!("Incoming raw message from {}: {}", sender_tag, raw);
         let data: Value = match serde_json::from_str(&raw) {
             Ok(v) => v,
             Err(e) => {
@@ -61,348 +74,213 @@ pub fn new(
                 return;
             }
         };
+        log::info!("Parsed JSON message from {}: {}", sender_tag, data);
         if let Some(action) = data.get("action").and_then(Value::as_str) {
             match action {
-                "connect" => self.handle_connect(sender_tag).await,
-                "createGroup" => self.handle_create_group(&data, sender_tag).await,
-                "joinGroup" => self.handle_join_group(&data, sender_tag).await,
-                "inviteGroup" => self.handle_invite_group(&data, sender_tag).await,
-                "approveGroup" => self.handle_approve_group(&data, sender_tag).await,
+                // Step 1: new user registration
+                "register" => self.handle_register(&data, sender_tag).await,
+
+                // Step 2: existing user re-connects
+                "connect" => self.handle_connect(&data, sender_tag).await,
+
+                // Step 3: client sends a group message (Redis Streams + push)
                 "sendGroup" => self.handle_send_group(&data, sender_tag).await,
+                // Step 4: client fetches new group messages (Redis Streams + pull)
+                "fetchGroup" => self.handle_fetch_group(&data, sender_tag).await,
                 _ => log::error!("Unknown action: {}", action),
             }
-        } else {
-            log::error!("Missing action field");
         }
     }
 
-    async fn handle_create_group(&mut self, data: &Value, sender_tag: AnonymousSenderTag) {
-        let group_name = data.get("groupName").and_then(Value::as_str);
-        let is_public = data
-            .get("isPublic")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let is_discoverable = data
-            .get("isDiscoverable")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-
-        if group_name.is_none() || !Self::is_valid_group_name(group_name.unwrap()) {
-            self.send_encapsulated_reply(
-                sender_tag,
-                "error: invalid group name".into(),
-                "createGroupResponse",
-                None,
-            )
-            .await;
-            return;
-        }
-        // Identify the user
-        let username = match self
-            .db
-            .get_user_by_sender_tag(&sender_tag.to_string())
-            .await
-        {
-            Ok(Some((u, _, _))) => u,
+    /// Handle a client 'register': store their username + public key.
+    async fn handle_register(&mut self, data: &Value, sender_tag: AnonymousSenderTag) {
+        let username = match data.get("username").and_then(Value::as_str) {
+            Some(u) if !u.is_empty() => u,
             _ => {
                 self.send_encapsulated_reply(
                     sender_tag,
-                    "error: unknown user".into(),
-                    "createGroupResponse",
+                    "error: missing or invalid username".into(),
+                    "registerResponse",
                     None,
                 )
                 .await;
                 return;
             }
         };
-        let group_id = Uuid::new_v4().to_string();
-        let group_name = group_name.unwrap();
-        let created = self
-            .db
-            .create_group(&group_id, group_name, &username, is_public, is_discoverable)
-            .await
-            .unwrap_or(false);
-        if created {
-            let _ = self
-                .db
-                .add_group_member(&group_id, &username, &sender_tag.to_string())
-                .await;
-            self.send_encapsulated_reply(
-                sender_tag,
-                json!({"groupId": group_id}).to_string(),
-                "createGroupResponse",
-                None,
-            )
-            .await;
-        } else {
-            self.send_encapsulated_reply(
-                sender_tag,
-                "error: create group failed".into(),
-                "createGroupResponse",
-                None,
-            )
-            .await;
-        }
-    }
-
-    async fn handle_join_group(&mut self, data: &Value, sender_tag: AnonymousSenderTag) {
-        let group_id = data.get("groupId").and_then(Value::as_str);
-        if group_id.is_none() {
-            self.send_encapsulated_reply(
-                sender_tag,
-                "error: missing groupId".into(),
-                "joinGroupResponse",
-                None,
-            )
-            .await;
-            return;
-        }
-        let group_id = group_id.unwrap();
-        let username = match self
-            .db
-            .get_user_by_sender_tag(&sender_tag.to_string())
-            .await
-        {
-            Ok(Some((u, _, _))) => u,
+        // The PGP public key (ASCII-armored) to register
+        let pubkey_armored = match data.get("publicKey").and_then(Value::as_str) {
+            Some(pk) if !pk.is_empty() => pk,
             _ => {
                 self.send_encapsulated_reply(
                     sender_tag,
-                    "error: unknown user".into(),
-                    "joinGroupResponse",
+                    "error: missing or invalid publicKey".into(),
+                    "registerResponse",
                     None,
                 )
                 .await;
                 return;
             }
         };
-        if self.db.is_group_public(group_id).await.unwrap_or(false) {
-            let added = self
-                .db
-                .add_group_member(group_id, &username, &sender_tag.to_string())
+        match self
+            .db
+            .add_user(username, pubkey_armored, &sender_tag.to_string())
+            .await
+        {
+            Ok(true) => {
+                self.send_encapsulated_reply(sender_tag, "success".into(), "registerResponse", None)
+                    .await
+            }
+            Ok(false) => {
+                self.send_encapsulated_reply(
+                    sender_tag,
+                    "error: user already registered".into(),
+                    "registerResponse",
+                    None,
+                )
                 .await
-                .unwrap_or(false);
-            if added {
+            }
+            Err(e) => {
+                log::error!("DB error during register: {}", e);
                 self.send_encapsulated_reply(
                     sender_tag,
-                    "success".into(),
-                    "joinGroupResponse",
-                    None,
-                )
-                .await;
-            } else {
-                self.send_encapsulated_reply(
-                    sender_tag,
-                    "error: join group failed".into(),
-                    "joinGroupResponse",
+                    "error: registration failed".into(),
+                    "registerResponse",
                     None,
                 )
                 .await;
             }
-        } else {
-            self.send_encapsulated_reply(
-                sender_tag,
-                "error: group is private".into(),
-                "joinGroupResponse",
-                None,
-            )
-            .await;
         }
     }
 
-    async fn handle_invite_group(&mut self, data: &Value, sender_tag: AnonymousSenderTag) {
-        let group_id = data.get("groupId").and_then(Value::as_str);
-        let invitee = data.get("username").and_then(Value::as_str);
-        if group_id.is_none() || invitee.is_none() {
-            self.send_encapsulated_reply(
-                sender_tag,
-                "error: missing fields".into(),
-                "inviteGroupResponse",
-                None,
-            )
-            .await;
-            return;
-        }
-        let group_id = group_id.unwrap();
-        let invitee = invitee.unwrap();
-        if !self
-            .db
-            .is_user_admin(group_id, &sender_tag.to_string())
-            .await
-            .unwrap_or(false)
-        {
-            self.send_encapsulated_reply(
-                sender_tag,
-                "error: not group admin".into(),
-                "inviteGroupResponse",
-                None,
-            )
-            .await;
-            return;
-        }
-        let invitee_tag = match self.db.get_user_by_username(invitee).await.unwrap_or(None) {
-            Some((_, _, tag)) => tag,
-            None => {
+    /// Handle a client 'connect': verify publicKey + signature, then subscribe.
+    async fn handle_connect(&mut self, data: &Value, sender_tag: AnonymousSenderTag) {
+        let username = match data.get("username").and_then(Value::as_str) {
+            Some(u) if !u.is_empty() => u,
+            _ => {
                 self.send_encapsulated_reply(
                     sender_tag,
-                    "error: user not found".into(),
-                    "inviteGroupResponse",
+                    "error: missing username".into(),
+                    "connectResponse",
                     None,
                 )
                 .await;
                 return;
             }
         };
-        let added = self
-            .db
-            .add_group_invite(group_id, invitee)
-            .await
-            .unwrap_or(false);
-        if !added {
-            self.send_encapsulated_reply(
-                sender_tag,
-                "error: cannot invite".into(),
-                "inviteGroupResponse",
-                None,
-            )
-            .await;
-            return;
-        }
-        let content = json!({"groupId": group_id, "inviter": sender_tag.to_string()}).to_string();
-        if let Ok(recipient) = AnonymousSenderTag::try_from_base58_string(&invitee_tag) {
-            let _ = self.sender.send_reply(recipient, content.clone()).await;
-        }
-        self.send_encapsulated_reply(sender_tag, "success".into(), "inviteGroupResponse", None)
-            .await;
-    }
-
-    async fn handle_approve_group(&mut self, data: &Value, sender_tag: AnonymousSenderTag) {
-        let group_id = data.get("groupId").and_then(Value::as_str);
-        let user = data.get("username").and_then(Value::as_str);
-        if group_id.is_none() || user.is_none() {
-            self.send_encapsulated_reply(
-                sender_tag,
-                "error: missing fields".into(),
-                "approveGroupResponse",
-                None,
-            )
-            .await;
-            return;
-        }
-        let group_id = group_id.unwrap();
-        let user = user.unwrap();
-        if !self
-            .db
-            .is_user_admin(group_id, &sender_tag.to_string())
-            .await
-            .unwrap_or(false)
-        {
-            self.send_encapsulated_reply(
-                sender_tag,
-                "error: not group admin".into(),
-                "approveGroupResponse",
-                None,
-            )
-            .await;
-            return;
-        }
-        if !self
-            .db
-            .is_user_invited(group_id, user)
-            .await
-            .unwrap_or(false)
-        {
-            self.send_encapsulated_reply(
-                sender_tag,
-                "error: user not invited".into(),
-                "approveGroupResponse",
-                None,
-            )
-            .await;
-            return;
-        }
-        let user_tag = match self.db.get_user_by_username(user).await.unwrap_or(None) {
-            Some((_, _, tag)) => tag,
-            None => {
+        // The client’s ASCII-armored PGP public key (registered earlier)
+        let pubkey_armored = match data.get("publicKey").and_then(Value::as_str) {
+            Some(pk) if !pk.is_empty() => pk,
+            _ => {
                 self.send_encapsulated_reply(
                     sender_tag,
-                    "error: user not found".into(),
-                    "approveGroupResponse",
+                    "error: missing publicKey".into(),
+                    "connectResponse",
                     None,
                 )
                 .await;
                 return;
             }
         };
-        let added = self
-            .db
-            .add_group_member(group_id, user, &user_tag)
-            .await
-            .unwrap_or(false);
-        let removed = self
-            .db
-            .remove_group_invite(group_id, user)
-            .await
-            .unwrap_or(false);
-        if added && removed {
-            self.send_encapsulated_reply(
-                sender_tag,
-                "success".into(),
-                "approveGroupResponse",
-                None,
-            )
-            .await;
-        } else {
-            self.send_encapsulated_reply(
-                sender_tag,
-                "error: cannot approve".into(),
-                "approveGroupResponse",
-                None,
-            )
-            .await;
-        }
-    }
+        let signature = match data.get("signature").and_then(Value::as_str) {
+            Some(sig) if !sig.is_empty() => sig,
+            _ => {
+                self.send_encapsulated_reply(
+                    sender_tag,
+                    "error: missing signature".into(),
+                    "connectResponse",
+                    None,
+                )
+                .await;
+                return;
+            }
+        };
 
-    /// Handle a client 'connect': subscribe their SURB to all group channels.
-    async fn handle_connect(&mut self, sender_tag: AnonymousSenderTag) {
+        // 1) Check stored public key – compare fingerprints, tolerant to armour
+        let stored_pk = match self.db.get_user_by_username(username).await {
+            Ok(Some((_u, pk, _))) => pk,
+            _ => {
+                self.send_encapsulated_reply(
+                    sender_tag,
+                    "error: user not registered".into(),
+                    "connectResponse",
+                    None,
+                )
+                .await;
+                return;
+            }
+        };
+
+        let stored_fp = Cert::from_reader(Cursor::new(stored_pk.as_bytes()))
+            .ok()
+            .map(|c| c.fingerprint().to_string());
+        let supplied_fp = Cert::from_reader(Cursor::new(pubkey_armored.as_bytes()))
+            .ok()
+            .map(|c| c.fingerprint().to_string());
+
+        if stored_fp.is_none() || supplied_fp.is_none() || stored_fp != supplied_fp {
+            self.send_encapsulated_reply(
+                sender_tag,
+                "error: publicKey mismatch or malformed".into(),
+                "connectResponse",
+                None,
+            )
+            .await;
+            return;
+        }
+
+        // 2) Verify the PGP detached signature over the registered public key
+        let signed_payload = pubkey_armored;
+        if !self
+            .crypto
+            .verify_pgp_signature(&pubkey_armored, signed_payload, signature)
+        {
+            self.send_encapsulated_reply(
+                sender_tag,
+                "error: signature verification failed".into(),
+                "connectResponse",
+                None,
+            )
+            .await;
+            return;
+        }
+
+        // 3) Send success and then subscribe to channels
+        self.send_encapsulated_reply(sender_tag, "success".into(), "connectResponse", None)
+            .await;
+        // subscribe to the single group channel
         let tag_str = sender_tag.to_string();
-        if let Ok(groups) = self.db.get_groups_for_member(&tag_str).await {
-            for group_id in groups {
-                let channel = format!("group:channel:{}", group_id);
-                let my_tag = tag_str.clone();
-                let mixnet_sender = self.sender.clone();
-                let client = self.redis_client.clone();
-                tokio::spawn(async move {
-                        if let Ok(conn) = client.get_async_connection().await {
-                        let mut pubsub = conn.into_pubsub();
-                        let _ = pubsub.subscribe(&channel).await;
-                        let mut on_message = pubsub.on_message();
-                        while let Some(msg) = on_message.next().await {
-                            if let Ok(payload) = msg.get_payload::<String>() {
-                                if let Ok(tag) = AnonymousSenderTag::try_from_base58_string(&my_tag) {
-                                    let _ = mixnet_sender.send_reply(tag, payload.clone()).await;
-                                }
-                            }
+        let channel = "group:channel";
+        let my_tag = tag_str.clone();
+        let mixnet_sender = self.sender.clone();
+        let client = self.redis_client.clone();
+        tokio::spawn(async move {
+            if let Ok(conn) = client.get_async_connection().await {
+                let mut pubsub = conn.into_pubsub();
+                let _ = pubsub.subscribe(channel).await;
+                let mut on_message = pubsub.on_message();
+                while let Some(msg) = on_message.next().await {
+                    if let Ok(payload) = msg.get_payload::<String>() {
+                        if let Ok(tag) = AnonymousSenderTag::try_from_base58_string(&my_tag) {
+                            let _ = mixnet_sender.send_reply(tag, payload).await;
                         }
                     }
-                });
+                }
             }
-        }
+        });
     }
 
     async fn handle_send_group(&mut self, data: &Value, sender_tag: AnonymousSenderTag) {
-        let group_id = data.get("groupId").and_then(Value::as_str);
         let ciphertext = data.get("ciphertext").and_then(Value::as_str);
-        if group_id.is_none() || ciphertext.is_none() {
+        if ciphertext.is_none() {
             self.send_encapsulated_reply(
                 sender_tag,
-                "error: missing fields".into(),
+                "error: missing ciphertext".into(),
                 "sendGroupResponse",
                 None,
             )
             .await;
             return;
         }
-        let group_id = group_id.unwrap();
         let ciphertext = ciphertext.unwrap();
         let username = match self
             .db
@@ -421,18 +299,61 @@ pub fn new(
                 return;
             }
         };
-        // publish the encrypted message exactly once into Redis Pub/Sub
-        let channel = format!("group:channel:{}", group_id);
+        // push the encrypted message into Redis Stream for pull-based fan-out
+        let stream_key = "group:stream";
         let payload = json!({
-            "groupId": group_id,
             "sender": username,
             "ciphertext": ciphertext
         })
         .to_string();
         if let Ok(mut conn) = self.redis_client.get_async_connection().await {
-            let _ : Result<usize, _> = conn.publish(channel, payload).await;
+            // XADD <stream_key> * message <payload>
+            let _: Result<String, _> = conn
+                .xadd(&stream_key, "*", &[("message", payload.as_str())])
+                .await;
         }
         self.send_encapsulated_reply(sender_tag, "success".into(), "sendGroupResponse", None)
+            .await;
+    }
+
+    /// Handle a client request to fetch new group messages (Redis Streams + pull)
+    async fn handle_fetch_group(&mut self, data: &Value, sender_tag: AnonymousSenderTag) {
+        // Extract parameters (lastSeenId is optional)
+        let last_seen = data
+            .get("lastSeenId")
+            .and_then(Value::as_str)
+            .unwrap_or("0-0");
+
+        // Read new entries from the Redis Stream for the single group
+        let stream_key = "group:stream";
+        let mut msgs = Vec::new();
+        if let Ok(mut conn) = self.redis_client.get_async_connection().await {
+            // Non-blocking XREAD from last_seen
+            if let Ok(reply) = conn
+                .xread::<_, _, Vec<redis::streams::StreamReadReply>>(&[&stream_key], &[last_seen])
+                .await
+            {
+                for stream in reply {
+                    for sk in stream.keys {
+                        for entry in sk.ids {
+                            // entry.id is the message ID
+                            // entry.map contains field-value pairs
+                            if let Some(redis::Value::Data(bytes)) = entry.map.get("message") {
+                                if let Ok(s) = String::from_utf8(bytes.clone()) {
+                                    msgs.push((s, entry.id.clone()));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Send back all new messages
+        let content = json!({
+            "messages": msgs    // Vec<(ciphertext, messageId)>
+        })
+        .to_string();
+        self.send_encapsulated_reply(sender_tag, content, "fetchGroupResponse", None)
             .await;
     }
 

@@ -1,143 +1,182 @@
-use anyhow::Result;
-use base64::{Engine as _, engine::general_purpose};
-use hex;
-use openssl::ec::{EcGroup, EcKey};
-use openssl::hash::MessageDigest;
-use openssl::nid::Nid;
-use openssl::pkcs5::pbkdf2_hmac;
-use openssl::pkey::PKey;
-use openssl::rand::rand_bytes;
-use openssl::sign::{Signer, Verifier};
-use openssl::symm::{Cipher, Crypter, Mode};
-use std::fs;
-use std::path::PathBuf;
+//! PGP-based key management and signing utilities using Sequoia OpenPGP 2.0.
+use anyhow::{Context, Result};
+use openpgp::{
+    PacketPile, armor::Kind as ArmorKind, cert::prelude::*, packet::Packet, parse::Parse,
+    policy::StandardPolicy, serialize::SerializeInto,
+};
+use sequoia_openpgp as openpgp;
+use std::{
+    fs,
+    io::{Read, Write},
+    path::PathBuf,
+};
 
-/// Utility for key generation, encryption, signing, and verification.
+/// Utility for PGP key generation, detached signing, and signature verification.
 pub struct CryptoUtils {
     key_dir: PathBuf,
+    username: String,
     password: String,
 }
 
 impl CryptoUtils {
-    /// Create a new CryptoUtils, ensuring the key directory exists.
-    pub fn new(key_dir: PathBuf, password: String) -> Result<Self> {
+    /// Initialize with the key directory, server username, and optional passphrase.
+    pub fn new(key_dir: PathBuf, username: String, password: String) -> Result<Self> {
         if !key_dir.exists() {
             fs::create_dir_all(&key_dir)?;
         }
-        Ok(Self { key_dir, password })
+        Ok(Self {
+            key_dir,
+            username,
+            password,
+        })
     }
 
-    fn derive_key(&self, salt: &[u8]) -> Result<[u8; 32]> {
-        let mut key = [0u8; 32];
-        pbkdf2_hmac(
-            self.password.as_bytes(),
-            salt,
-            100_000,
-            MessageDigest::sha256(),
-            &mut key,
+    /// Generate a new PGP certificate (with signing subkey), store secret + public armor,
+    /// and return the ASCII-armored public key.
+    pub fn generate_key_pair(&self, _username: &str) -> Result<String> {
+        // Build a new cert with a signing subkey.
+        let (cert, _revocation) = CertBuilder::new()
+            .add_userid(self.username.clone())
+            .add_signing_subkey()
+            .generate()?;
+
+        // Persist secret certificate (unencrypted).
+        let secret_armored = String::from_utf8(cert.as_tsk().armored().to_vec()?)?;
+        fs::write(
+            self.key_dir.join(format!("{}_secret.asc", self.username)),
+            &secret_armored,
         )?;
-        Ok(key)
+
+        // Persist public certificate.
+        let public_armored = String::from_utf8(cert.armored().to_vec()?)?;
+        fs::write(
+            self.key_dir.join(format!("{}_public.asc", self.username)),
+            &public_armored,
+        )?;
+
+        Ok(public_armored)
     }
 
-    fn encrypt_private_key(&self, private_key_pem: &[u8]) -> Result<String> {
-        let mut salt = [0u8; 16];
-        rand_bytes(&mut salt)?;
-        let mut iv = [0u8; 12];
-        rand_bytes(&mut iv)?;
-        let key = self.derive_key(&salt)?;
-        let cipher = Cipher::aes_256_gcm();
-        let mut crypter = Crypter::new(cipher, Mode::Encrypt, &key, Some(&iv))?;
-        let mut ciphertext = vec![0; private_key_pem.len() + cipher.block_size()];
-        let mut count = crypter.update(private_key_pem, &mut ciphertext)?;
-        count += crypter.finalize(&mut ciphertext[count..])?;
-        ciphertext.truncate(count);
-        let mut tag = [0u8; 16];
-        crypter.get_tag(&mut tag)?;
-        let mut data = Vec::new();
-        data.extend_from_slice(&salt);
-        data.extend_from_slice(&iv);
-        data.extend_from_slice(&tag);
-        data.extend_from_slice(&ciphertext);
-        Ok(general_purpose::STANDARD.encode(data))
+    /// Create an ASCII-armored detached signature over `message` using the stored secret key.
+    pub fn sign_message(&self, _username: &str, message: &str) -> Result<String> {
+        let secret_armored =
+            fs::read_to_string(self.key_dir.join(format!("{}_secret.asc", self.username)))?;
+        sign_detached(&secret_armored, message)
     }
 
-    fn decrypt_private_key(&self, encrypted_data: &str) -> Result<Vec<u8>> {
-        let data = general_purpose::STANDARD.decode(encrypted_data)?;
-        let (salt, rest) = data.split_at(16);
-        let (iv, rest) = rest.split_at(12);
-        let (tag, ciphertext) = rest.split_at(16);
-        let key = self.derive_key(salt)?;
-        let cipher = Cipher::aes_256_gcm();
-        let mut crypter = Crypter::new(cipher, Mode::Decrypt, &key, Some(iv))?;
-        crypter.set_tag(tag)?;
-        let mut plaintext = vec![0; ciphertext.len() + cipher.block_size()];
-        let mut count = crypter.update(ciphertext, &mut plaintext)?;
-        count += crypter.finalize(&mut plaintext[count..])?;
-        plaintext.truncate(count);
-        Ok(plaintext)
-    }
-
-    /// Generate and securely store a new ECDSA (P-256) key pair.
-    /// Returns the public key PEM as a String.
-    pub fn generate_key_pair(&self, username: &str) -> Result<String> {
-        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
-        let key = EcKey::generate(&group)?;
-        let private_key_pem = key.private_key_to_pem()?;
-        let public_key_pem = key.public_key_to_pem()?;
-        let encrypted = self.encrypt_private_key(&private_key_pem)?;
-        let priv_path = self.key_dir.join(format!("{}_private_key.enc", username));
-        let pub_path = self.key_dir.join(format!("{}_public_key.pem", username));
-        fs::write(priv_path, encrypted)?;
-        fs::write(pub_path, &public_key_pem)?;
-        log::info!("generateKeyPair - success!");
-        Ok(String::from_utf8(public_key_pem)?)
-    }
-
-    /// Load and decrypt a private key for the given username.
-    pub fn load_private_key(&self, username: &str) -> Result<PKey<openssl::pkey::Private>> {
-        let path = self.key_dir.join(format!("{}_private_key.enc", username));
-        let encrypted = fs::read_to_string(path)?;
-        let decrypted = self.decrypt_private_key(&encrypted)?;
-        let key = EcKey::private_key_from_pem(&decrypted)?;
-        Ok(PKey::from_ec_key(key)?)
-    }
-
-    /// Load the public key for the given username.
-    pub fn load_public_key(&self, username: &str) -> Result<PKey<openssl::pkey::Public>> {
-        let path = self.key_dir.join(format!("{}_public_key.pem", username));
-        let pem = fs::read(&path)?;
-        let key = EcKey::public_key_from_pem(&pem)?;
-        Ok(PKey::from_ec_key(key)?)
-    }
-
-    /// Sign a message using the user's private key. Returns a hex-encoded signature.
-    pub fn sign_message(&self, username: &str, message: &str) -> Result<String> {
-        let pkey = self.load_private_key(username)?;
-        let mut signer = Signer::new_without_digest(&pkey)?;
-        signer.update(message.as_bytes())?;
-        let sig = signer.sign_to_vec()?;
-        Ok(hex::encode(sig))
-    }
-
-    /// Verify a hex-encoded signature against a public key PEM.
-    pub fn verify_signature(
+    /// Verify an ASCII-armored PGP detached signature against a PGP public key.
+    pub fn verify_pgp_signature(
         &self,
-        public_key_pem: &str,
+        public_key_armored: &str,
         message: &str,
-        signature_hex: &str,
+        signature_armored: &str,
     ) -> bool {
-        if let Ok(sig) = hex::decode(signature_hex) {
-            if let Ok(key) = EcKey::public_key_from_pem(public_key_pem.as_bytes()) {
-                if let Ok(pkey) = PKey::from_ec_key(key) {
-                    if let Ok(mut verifier) = Verifier::new_without_digest(&pkey) {
-                        if verifier.update(message.as_bytes()).is_ok() {
-                            return verifier.verify(&sig).unwrap_or(false);
-                        }
-                    }
-                }
+        log::info!(
+            "verify_pgp_signature: public_key length={}, message length={}, signature length={}",
+            public_key_armored.len(),
+            message.len(),
+            signature_armored.len()
+        );
+        let cert = match Cert::from_reader(public_key_armored.as_bytes()) {
+            Ok(c) => c,
+            Err(err) => {
+                log::error!("verify_pgp_signature: parse public key: {:?}", err);
+                return false;
+            }
+        };
+        let mut reader = openpgp::armor::Reader::from_bytes(
+            signature_armored.as_bytes(),
+            openpgp::armor::ReaderMode::Tolerant(Some(ArmorKind::Signature)),
+        );
+        let mut decoded = Vec::new();
+        if reader.read_to_end(&mut decoded).is_err() {
+            log::error!("verify_pgp_signature: dearmor signature failed");
+            return false;
+        }
+        // Parse the detached signature packet(s) from the decoded data.
+        let pile = match PacketPile::from_bytes(&decoded) {
+            Ok(p) => p,
+            Err(err) => {
+                log::error!(
+                    "verify_pgp_signature: parse signature packet pile: {:?}",
+                    err
+                );
+                return false;
+            }
+        };
+        // Extract the first signature packet.
+        let sig = match pile.into_children().find_map(|pkt| {
+            if let Packet::Signature(s) = pkt {
+                Some(s)
+            } else {
+                None
+            }
+        }) {
+            Some(s) => s,
+            None => {
+                log::error!("verify_pgp_signature: no signature packet found");
+                return false;
+            }
+        };
+        // Verify against all signing-capable keys in the certificate.
+        let policy = &StandardPolicy::new();
+        for binding in cert
+            .keys()
+            .with_policy(policy, None)
+            .supported()
+            .alive()
+            .for_signing()
+        {
+            if sig
+                .verify_message(binding.key(), message.as_bytes())
+                .is_ok()
+            {
+                return true;
             }
         }
-        log::error!("verifySignature - failed for message signing verification");
         false
     }
+}
+
+// -----------------------------------------------------------------------------
+// PGP helper – create an ASCII-armoured *detached* signature over `payload`.
+// -----------------------------------------------------------------------------
+fn sign_detached(secret_cert: &str, payload: &str) -> Result<String> {
+    use openpgp::{
+        armor::Kind as ArmorKind,
+        cert::prelude::*,
+        policy::StandardPolicy,
+        serialize::stream::{Armorer, Message, Signer},
+        types::HashAlgorithm,
+    };
+
+    // Load certificate and pick a signing-capable subkey.
+    let cert = openpgp::Cert::from_reader(secret_cert.as_bytes())?;
+    let policy = &StandardPolicy::new();
+    let keypair = cert
+        .keys()
+        .secret()
+        .with_policy(policy, None)
+        .supported()
+        .alive()
+        .for_signing()
+        .next()
+        .context("no usable signing key")?
+        .key()
+        .clone()
+        .into_keypair()?;
+
+    // Armor & detach-sign.
+    let mut buf = Vec::new();
+    {
+        let m = Message::new(&mut buf);
+        let m = Armorer::new(m).kind(ArmorKind::Signature).build()?;
+        let mut signer = Signer::new(m, keypair)?
+            .detached()
+            .hash_algo(HashAlgorithm::SHA256)?
+            .build()?;
+        signer.write_all(payload.as_bytes())?;
+        signer.finalize()?;
+    }
+    Ok(String::from_utf8(buf)?)
 }

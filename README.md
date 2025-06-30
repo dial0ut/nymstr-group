@@ -28,7 +28,7 @@ cargo build --release
 
 ## Configuration
 
-Configure the server via environment variables or by creating a `.env` file in the project root. The following variables are supported:
+Configure the server via environment variables. The following variables are supported:
 
 | Variable         | Default                         | Description                                        |
 |------------------|---------------------------------|----------------------------------------------------|
@@ -40,21 +40,22 @@ Configure the server via environment variables or by creating a `.env` file in t
 | `NYM_SDK_STORAGE`| `storage/<NYM_CLIENT_ID>`       | Directory for Nym SDK storage                      |
 | `REDIS_URL`      | `redis://127.0.0.1/`            | Redis connection URL                               |
 
-Example `.env`:
-```dotenv
-LOG_FILE_PATH=logs/groupd.log
-DATABASE_PATH=storage/groupd.db
-KEYS_DIR=storage/keys
-SECRET_PATH=secrets/encryption_password
-NYM_CLIENT_ID=groupd
-NYM_SDK_STORAGE=storage/groupd
-REDIS_URL=redis://127.0.0.1/
+### Quick start
+
+Copy the example environment file and export all variables:
+
+```bash
+cp .env.example .env
+export $(grep -v '^\s*#' .env | xargs)
 ```
 
 Before starting, initialize the encryption password file:
 ```bash
 mkdir -p "$(dirname "${SECRET_PATH:-secrets/encryption_password}")"
 echo "YOUR_ENCRYPTION_PASSWORD" > "${SECRET_PATH:-secrets/encryption_password}"
+
+# On first run the server will auto-generate its ECDSA keypair for signing replies
+#+ using $KEYS_DIR/${NYM_CLIENT_ID}_*.pem
 ```
 
 ## Running the Server
@@ -64,13 +65,22 @@ cargo run --release
 ```
 
 The server will:
-- Load environment variables (.env)
+- Load environment variables from the environment
 - Initialize logging to console and file
 - Set up SQLite database and tables
 - Prepare cryptographic key storage
 - Connect to the Nym mixnet using `nym-sdk`
 - Subscribe to Redis channels for group pub/sub
-- Listen for incoming JSON commands over the mixnet
+# Listen for incoming JSON commands over the mixnet
+
+## Example Rust CLI client
+
+An example CLI client is provided in `examples/client.rs`. It uses the Nym mixnet to send JSON actions to the server and print incoming messages.
+
+```bash
+# after exporting environment variables (see Quick start)
+cargo run --example client -- <server_nym_address>
+```
 
 ## API: JSON Actions
 
