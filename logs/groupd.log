@@ -652,3 +652,33 @@
 2025-06-30T17:34:34.790353824-05:00 - [32mINFO[0m - nym_client_core_surb_storage::backend::fs_backend::manager - Database migration finished!
 2025-06-30T17:34:36.535248245-05:00 - [32mINFO[0m - nym_client_core_surb_storage - Data flush is complete
 2025-06-30T17:34:39.783029357-05:00 - [32mINFO[0m - nym_task::manager - Timeout reached, forcing shutdown
+2025-06-30T22:50:38.285530592-05:00 - [33mWARN[0m - sqlx::query - slow statement: execution time exceeded alert threshold summary="PRAGMA journal_mode = WAL; …" db.statement="\n\nPRAGMA journal_mode = WAL;\nPRAGMA foreign_keys = ON;\nCREATE TABLE IF NOT EXISTS users (\n  username TEXT PRIMARY KEY,\n  publicKey TEXT NOT NULL\n);\nCREATE TABLE IF NOT EXISTS groups (\n  groupId TEXT PRIMARY KEY,\n  groupName TEXT NOT NULL,\n  admin TEXT NOT NULL,\n  isPublic INTEGER NOT NULL,\n  isDiscoverable INTEGER NOT NULL\n);\nCREATE TABLE IF NOT EXISTS group_members (\n  groupId TEXT NOT NULL,\n  username TEXT NOT NULL,\n  PRIMARY KEY (groupId, username),\n  FOREIGN KEY (groupId) REFERENCES groups(groupId),\n  FOREIGN KEY (username) REFERENCES users(username)\n);\nCREATE TABLE IF NOT EXISTS group_invites (\n  groupId TEXT NOT NULL,\n  username TEXT NOT NULL,\n  PRIMARY KEY (groupId, username),\n  FOREIGN KEY (groupId) REFERENCES groups(groupId),\n  FOREIGN KEY (username) REFERENCES users(username)\n);\nCREATE TABLE IF NOT EXISTS pending_users (\n  username TEXT PRIMARY KEY,\n  publicKey TEXT NOT NULL\n);\n" rows_affected=0 rows_returned=1 elapsed=11.107178345s elapsed_secs=11.107178345 slow_threshold=1s
+2025-06-30T22:50:38.285971461-05:00 - [32mINFO[0m - nymstr_groupd::db_utils - DbUtils initialized with db_url=sqlite://storage/groupd.db
+2025-06-30T22:50:38.286330119-05:00 - [32mINFO[0m - nym_client_core::client::base_client::non_wasm_helpers - loading existing surb database
+2025-06-30T22:50:38.299498581-05:00 - [32mINFO[0m - nym_client_core_surb_storage::backend::fs_backend::manager - Database migration finished!
+2025-06-30T22:50:38.343384522-05:00 - [32mINFO[0m - nym_client_core::client::base_client - Starting nym client
+2025-06-30T22:50:38.347651487-05:00 - [32mINFO[0m - nym_client_core::client::base_client - Starting statistics control...
+2025-06-30T22:50:38.347901693-05:00 - [32mINFO[0m - nym_client_core::client::base_client - Obtaining initial network topology
+2025-06-30T22:50:44.335317375-05:00 - [32mINFO[0m - nym_client_core::client::base_client - Starting topology refresher...
+2025-06-30T22:50:44.335472518-05:00 - [32mINFO[0m - nym_gateway_client::client - perform_initial_authentication; gateway=9wpTv1TyekdV2JfPXtfAG8q38b6R3iDZhLPpgAQqTYZ4 gateway_address=ws://45.83.21.163:9000/
+2025-06-30T22:50:45.108025825-05:00 - [32mINFO[0m - nym_gateway_client::bandwidth - remaining bandwidth: 0.00 B
+2025-06-30T22:50:45.108127785-05:00 - [32mINFO[0m - nym_gateway_client::client - Claiming more bandwidth with existing credentials. Stop the process now if you don't want that to happen.
+2025-06-30T22:50:45.108147839-05:00 - [33mWARN[0m - nym_gateway_client::client - Not enough bandwidth. Trying to get more bandwidth, this might take a while
+2025-06-30T22:50:45.108161202-05:00 - [32mINFO[0m - nym_gateway_client::client - The client is running in disabled credentials mode - attempting to claim bandwidth without a credential
+2025-06-30T22:50:45.286754487-05:00 - [32mINFO[0m - nym_gateway_client::client - managed to claim testnet bandwidth
+2025-06-30T22:50:45.317376285-05:00 - [32mINFO[0m - nym_client_core::client::base_client - Starting received messages buffer controller...
+2025-06-30T22:50:45.317523844-05:00 - [32mINFO[0m - nym_client_core::client::base_client - Starting mix traffic controller...
+2025-06-30T22:50:45.317637947-05:00 - [32mINFO[0m - nym_client_core::client::base_client - Starting real traffic stream...
+2025-06-30T22:50:45.317879034-05:00 - [32mINFO[0m - nym_client_core::client::base_client - Starting loop cover traffic stream...
+2025-06-30T22:50:45.318028121-05:00 - [32mINFO[0m - nymstr_groupd - Connected to mixnet. Nym Address: 2cE2LtaTrebe3ypGCrj1GFUb8H4cqjfoCwtFmYRgw8sF.DWBBfrtygtuji74LJnjYdhfpuF9b5C6QVdbx4SBuvPaT@9wpTv1TyekdV2JfPXtfAG8q38b6R3iDZhLPpgAQqTYZ4
+2025-06-30T22:51:13.410002118-05:00 - [33mWARN[0m - hickory_proto::h2::h2_client_stream - h2 connection failed: peer closed connection without sending TLS close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof
+2025-06-30T22:51:13.410002073-05:00 - [33mWARN[0m - hickory_proto::h2::h2_client_stream - h2 connection failed: peer closed connection without sending TLS close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof
+2025-06-30T22:52:02.358535390-05:00 - [32mINFO[0m - nymstr_groupd - Shutting down mixnet client.
+2025-06-30T22:52:02.359123052-05:00 - [32mINFO[0m - nym_client_core_surb_storage - PersistentReplyStorage is flushing all reply-related data to underlying storage
+2025-06-30T22:52:02.359282838-05:00 - [32mINFO[0m - nym_client_core_surb_storage - you MUST NOT forcefully shutdown now or you risk data corruption!
+2025-06-30T22:52:02.359403894-05:00 - [33mWARN[0m - nym_gateway_client::packet_router - Failed to send acks due to receiver task shutdown
+2025-06-30T22:52:02.359608355-05:00 - [31mERROR[0m - nym_gateway_client::traits - failed to route received acks: this operation couldn't be completed as the program is in the process of shutting down
+2025-06-30T22:52:02.368796117-05:00 - [33mWARN[0m - nym_client_core::client::cover_traffic_stream - Failed to send cover message - channel closed
+2025-06-30T22:52:03.485047651-05:00 - [32mINFO[0m - nym_client_core_surb_storage::backend::fs_backend::manager - Database migration finished!
+2025-06-30T22:52:04.825477587-05:00 - [32mINFO[0m - nym_client_core_surb_storage - Data flush is complete
+2025-06-30T22:52:07.360844345-05:00 - [32mINFO[0m - nym_task::manager - Timeout reached, forcing shutdown
