@@ -19,3 +19,6 @@ nym-sdk = { git = "https://github.com/nymtech/nym", branch = "master" }
 uuid = { version = "1", features = ["v4"] }
 sequoia-openpgp = "2"
 redis = { version = "0.21", features = ["aio", "tokio-comp"] }
+
+[dev-dependencies]
+tempfile = "3"

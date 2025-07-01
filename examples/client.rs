@@ -13,7 +13,6 @@ use sequoia_openpgp::cert::prelude::*;
 use sequoia_openpgp::policy::StandardPolicy;
 use sequoia_openpgp::serialize::SerializeInto;
 use sequoia_openpgp::serialize::stream::{Armorer, Message, Signer as StreamSigner};
-use sequoia_openpgp::types::HashAlgorithm;
 use serde_json::{Value, json};
 use std::{
     env,
@@ -49,7 +48,7 @@ async fn main() -> Result<()> {
         .add_signing_subkey()
         .generate()?;
 
-    let mut keypair = cert
+    let keypair = cert
         .keys()
         .unencrypted_secret()
         .with_policy(&StandardPolicy::new(), None)

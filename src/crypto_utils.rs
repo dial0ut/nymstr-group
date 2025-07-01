@@ -12,22 +12,42 @@ use std::{
 };
 
 /// Utility for PGP key generation, detached signing, and signature verification.
+#[derive(Clone)]
 pub struct CryptoUtils {
     key_dir: PathBuf,
     username: String,
-    password: String,
+    _password: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Result;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_generate_sign_verify() -> Result<()> {
+        let tmp = tempdir()?;
+        let cu = CryptoUtils::new(tmp.path().into(), "tester".into(), "".into())?;
+        let public = cu.generate_key_pair("tester")?;
+        let msg = "hello";
+        let sig = cu.sign_message("tester", msg)?;
+        assert!(cu.verify_pgp_signature(&public, msg, &sig));
+        assert!(!cu.verify_pgp_signature(&public, "bad", &sig));
+        Ok(())
+    }
 }
 
 impl CryptoUtils {
     /// Initialize with the key directory, server username, and optional passphrase.
-    pub fn new(key_dir: PathBuf, username: String, password: String) -> Result<Self> {
+    pub fn new(key_dir: PathBuf, username: String, _password: String) -> Result<Self> {
         if !key_dir.exists() {
             fs::create_dir_all(&key_dir)?;
         }
         Ok(Self {
             key_dir,
             username,
-            password,
+            _password,
         })
     }
 
@@ -144,7 +164,6 @@ impl CryptoUtils {
 fn sign_detached(secret_cert: &str, payload: &str) -> Result<String> {
     use openpgp::{
         armor::Kind as ArmorKind,
-        cert::prelude::*,
         policy::StandardPolicy,
         serialize::stream::{Armorer, Message, Signer},
         types::HashAlgorithm,
